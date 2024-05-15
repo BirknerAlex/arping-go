@@ -1,30 +1,29 @@
-//
 // command line arping utility which use the 'arping' library
 //
 // this utility need raw socket access, please run it
-//   under FreeBSD: as root
-//   under Linux: as root or with 'cap_net_raw' permission: sudo setcap cap_net_raw+ep <ARPING_PATH>
 //
+//	under FreeBSD: as root
+//	under Linux: as root or with 'cap_net_raw' permission: sudo setcap cap_net_raw+ep <ARPING_PATH>
 //
 // options:
-//   -h: print help and exit
-//   -v: verbose output
-//   -U: unsolicited/gratuitous ARP mode
-//   -i: interface name to use
-//   -t: timeout - duration with unit - such as 100ms, 500ms, 1s ...
 //
+//	-h: print help and exit
+//	-v: verbose output
+//	-U: unsolicited/gratuitous ARP mode
+//	-i: interface name to use
+//	-t: timeout - duration with unit - such as 100ms, 500ms, 1s ...
 //
 // exit code:
-//    0: target online
-//    1: target offline
-//    2: error occurred - see command output
 //
+//	0: target online
+//	1: target offline
+//	2: error occurred - see command output
 package main
 
 import (
 	"flag"
 	"fmt"
-	"github.com/j-keck/arping"
+	"github.com/BirknerAlex/arping-go"
 	"net"
 	"os"
 	"time"
@@ -55,8 +54,7 @@ func main() {
 	}
 	dstIP := net.ParseIP(flag.Arg(0))
 
-	var hwAddr net.HardwareAddr
-	var durationNanos time.Duration
+	var results []arping.Result
 	var err error
 	if *gratuitousFlag {
 		if len(*ifaceNameFlag) > 0 {
@@ -66,9 +64,9 @@ func main() {
 		}
 	} else {
 		if len(*ifaceNameFlag) > 0 {
-			hwAddr, durationNanos, err = arping.PingOverIfaceByName(dstIP, *ifaceNameFlag)
+			results, err = arping.PingOverIfaceByName(dstIP, *ifaceNameFlag)
 		} else {
-			hwAddr, durationNanos, err = arping.Ping(dstIP)
+			results, err = arping.Ping(dstIP)
 		}
 	}
 
@@ -88,17 +86,10 @@ func main() {
 		os.Exit(0)
 	}
 
-	// ping success
-	durationMicros := durationNanos / 1000
-
-	var durationString string
-	if durationMicros > 1000 {
-		durationString = fmt.Sprintf("%d,%03d", durationMicros/1000, durationMicros%1000)
-	} else {
-		durationString = fmt.Sprintf("%d", durationMicros)
+	for _, result := range results {
+		fmt.Printf("%s (%s) %s usec\n", dstIP, result.HwAddr, result.Duration.String())
 	}
 
-	fmt.Printf("%s (%s) %s usec\n", dstIP, hwAddr, durationString)
 	os.Exit(0)
 }
 

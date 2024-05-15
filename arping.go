@@ -2,66 +2,14 @@
 //
 // The currently supported platforms are: Linux and BSD.
 //
-//
 // The library requires raw socket access. So it must run as root, or with appropriate capabilities under linux:
 // `sudo setcap cap_net_raw+ep <BIN>`.
-//
-//
-// Examples:
-//
-//   ping a host:
-//   ------------
-//     package main
-//     import ("fmt"; "github.com/j-keck/arping"; "net")
-//
-//     func main(){
-//       dstIP := net.ParseIP("192.168.1.1")
-//       if hwAddr, duration, err := arping.Ping(dstIP); err != nil {
-//         fmt.Println(err)
-//       } else {
-//         fmt.Printf("%s (%s) %d usec\n", dstIP, hwAddr, duration/1000)
-//       }
-//     }
-//
-//
-//   resolve mac address:
-//   --------------------
-//     package main
-//     import ("fmt"; "github.com/j-keck/arping"; "net")
-//
-//     func main(){
-//       dstIP := net.ParseIP("192.168.1.1")
-//       if hwAddr, _, err := arping.Ping(dstIP); err != nil {
-//         fmt.Println(err)
-//       } else {
-//         fmt.Printf("%s is at %s\n", dstIP, hwAddr)
-//       }
-//     }
-//
-//
-//   check if host is online:
-//   ------------------------
-//     package main
-//     import ("fmt"; "github.com/j-keck/arping"; "net")
-//
-//     func main(){
-//       dstIP := net.ParseIP("192.168.1.1")
-//       _, _, err := arping.Ping(dstIP)
-//       if err == arping.ErrTimeout {
-//         fmt.Println("offline")
-//       }else if err != nil {
-//         fmt.Println(err.Error())
-//       }else{
-//         fmt.Println("online")
-//       }
-//     }
-//
 package arping
 
 import (
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -72,46 +20,51 @@ var (
 	// ErrTimeout error
 	ErrTimeout = errors.New("timeout")
 
-	verboseLog = log.New(ioutil.Discard, "", 0)
+	verboseLog = log.New(io.Discard, "", 0)
 	timeout    = time.Duration(500 * time.Millisecond)
 )
 
+type Result struct {
+	HwAddr   net.HardwareAddr
+	Duration time.Duration
+}
+
 // Ping sends an arp ping to 'dstIP'
-func Ping(dstIP net.IP) (net.HardwareAddr, time.Duration, error) {
+func Ping(dstIP net.IP) ([]Result, error) {
 	if err := validateIP(dstIP); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	iface, err := findUsableInterfaceForNetwork(dstIP)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	return PingOverIface(dstIP, *iface)
 }
 
 // PingOverIfaceByName sends an arp ping over interface name 'ifaceName' to 'dstIP'
-func PingOverIfaceByName(dstIP net.IP, ifaceName string) (net.HardwareAddr, time.Duration, error) {
+func PingOverIfaceByName(dstIP net.IP, ifaceName string) ([]Result, error) {
 	if err := validateIP(dstIP); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	return PingOverIface(dstIP, *iface)
 }
 
 // PingOverIface sends an arp ping over interface 'iface' to 'dstIP'
-func PingOverIface(dstIP net.IP, iface net.Interface) (net.HardwareAddr, time.Duration, error) {
+func PingOverIface(dstIP net.IP, iface net.Interface) ([]Result, error) {
 	if err := validateIP(dstIP); err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	srcMac := iface.HardwareAddr
 	srcIP, err := findIPInNetworkFromIface(dstIP, iface)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	broadcastMac := []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
@@ -119,7 +72,7 @@ func PingOverIface(dstIP net.IP, iface net.Interface) (net.HardwareAddr, time.Du
 
 	sock, err := initialize(iface)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 
 	type PingResult struct {
@@ -127,7 +80,8 @@ func PingOverIface(dstIP net.IP, iface net.Interface) (net.HardwareAddr, time.Du
 		duration time.Duration
 		err      error
 	}
-	pingResultChan := make(chan PingResult, 1)
+	pingResultChan := make(chan PingResult)
+	running := true
 
 	go func() {
 		defer sock.deinitialize()
@@ -136,7 +90,7 @@ func PingOverIface(dstIP net.IP, iface net.Interface) (net.HardwareAddr, time.Du
 		if sendTime, err := sock.send(request); err != nil {
 			pingResultChan <- PingResult{nil, 0, err}
 		} else {
-			for {
+			for running {
 				// receive arp response
 				response, receiveTime, err := sock.receive()
 
@@ -150,7 +104,6 @@ func PingOverIface(dstIP net.IP, iface net.Interface) (net.HardwareAddr, time.Du
 					verboseLog.Printf("process received arp: srcIP: '%s', srcMac: '%s'\n",
 						response.SenderIP(), response.SenderMac())
 					pingResultChan <- PingResult{response.SenderMac(), duration, err}
-					return
 				}
 
 				verboseLog.Printf("ignore received arp: srcIP: '%s', srcMac: '%s'\n",
@@ -159,12 +112,25 @@ func PingOverIface(dstIP net.IP, iface net.Interface) (net.HardwareAddr, time.Du
 		}
 	}()
 
-	select {
-	case pingResult := <-pingResultChan:
-		return pingResult.mac, pingResult.duration, pingResult.err
-	case <-time.After(timeout):
-		return nil, 0, ErrTimeout
+	results := make([]Result, 0)
+
+Break:
+	for {
+		select {
+		case pingResult := <-pingResultChan:
+			results = append(results, Result{HwAddr: pingResult.mac, Duration: pingResult.duration})
+		case <-time.After(timeout):
+			if len(results) == 0 {
+				return nil, ErrTimeout
+			}
+
+			break Break
+		}
 	}
+
+	running = false
+
+	return results, nil
 }
 
 // GratuitousArp sends an gratuitous arp from 'srcIP'
